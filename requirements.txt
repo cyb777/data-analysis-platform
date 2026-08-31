@@ -1,0 +1,15 @@
+# 多智能体问答平台 依赖
+langgraph>=1.0.4
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-openai
+langchain-redis
+redis
+pymysql
+python-dotenv
+loguru
+pydantic
+# FastAPI 服务化（SSE + 登录鉴权）
+fastapi
+uvicorn

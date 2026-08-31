@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.log
+
+# 环境变量与密钥（务必保留本地副本，切勿提交）
+.env
+
+# 数据库备份等本地产物
+*.sql
+backup/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+
+# 运行时缓存
+.codebuddy/

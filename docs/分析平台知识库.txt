@@ -1,0 +1,100 @@
+# 多智能体问答平台知识库
+
+本知识库给数据分析助手当"字典"用：包含 agent 库 6 张表的表结构说明、指标统计口径、查询规范。
+模型写 SQL 之前，先检索这里，找到问题涉及的表和口径，再生成 SQL——不用把全部表结构硬编码进提示词。
+
+## 一、表结构说明
+
+### 1. customer 客户表
+每行一个客户档案。
+- user_id：客户ID（主键）
+- username：客户名
+- registration_date：注册日期
+- country：国家
+- age：年龄
+- gender：性别
+- total_spent：消费总额（已完成订单金额之和，预汇总字段，直接可查）
+- order_count：订单数量（已完成订单数，预汇总字段）
+关联：user_id 关联 orders.user_id、customer_behavior.user_id
+
+### 2. customer_behavior 客户行为表
+每行一条客户行为记录（浏览/收藏/购买）。
+- user_id：客户ID
+- product_id：产品ID
+- action：行为类型，取值 购买/浏览/收藏
+- action_date：行为日期
+- device：设备
+用途：分析客户活跃度、复购行为（action='购买' 的次数）。
+
+### 3. orders 订单表
+每行一笔订单。
+- order_id：订单ID
+- user_id：客户ID
+- order_date：订单日期
+- product_id：产品ID
+- quantity：数量
+- total_amount：订单金额
+- payment_method：支付方式
+- order_status：订单状态，取值 已完成/待发货/已退款
+关联：user_id 关联 customer.user_id；product_id 关联 products.product_id
+
+### 4. products 产品表
+每行一个产品。
+- product_id：产品ID
+- product_name：产品名
+- category：类别
+- price：单价
+- stock：库存
+- sales_volume：销量
+- average_rating：平均评分
+
+### 5. sales 销售汇总表
+按 年份×类别 预汇总的销售数据（已经算好的，直接查即可，不用再 join）。
+- year：年份
+- total_sales：该年该类别总销售额
+- total_orders：总订单数
+- total_quantity_sold：总销量
+- category：类别
+- average_order_value：平均订单值（客单价）
+
+### 6. user_info 用户表
+平台登录账号（系统用户，不是业务客户）。
+- id：用户ID
+- user_name：用户名
+- email：邮箱
+- role：角色
+注意：业务客户在 customer 表，别和 user_info 混。
+
+## 二、指标口径（统计口径，写 SQL 按这里来）
+
+### 销售额
+销售额 = orders 表里 order_status='已完成' 的订单 total_amount 求和。
+注意：已退款、待发货的订单不算销售额。
+快捷方式：按类别/年份看销售额，直接用 sales 表的 total_sales，不用 join。
+
+### 客单价（平均订单值）
+客单价 = 总销售额 / 订单数。
+sales 表 average_order_value 已算好；或用 orders 表：SUM(total_amount) / COUNT(*)（只算已完成）。
+
+### TOP 排名
+问"最/前几名"时：ORDER BY 对应指标 DESC LIMIT N。
+例：卖得最好的产品 = 按 products.sales_volume 降序取前 5。
+
+### 退款
+退款金额 = orders 表 order_status='已退款' 的 total_amount 求和。
+退款率 = 退款订单数 / 总订单数。
+
+### 复购
+复购 = 同一客户在 customer_behavior 表有多次 action='购买' 的行为。
+统计复购率 = 有 2 次及以上购买行为的客户数 / 有购买行为的客户数。
+
+### 客户价值
+高价值客户：按 customer.total_spent 降序取 TOP。
+
+## 三、查询规范
+1. 只允许 SELECT，不能 UPDATE/DELETE/DROP
+2. 多表查询必须 JOIN，注意用对关联键（user_id / product_id）
+3. 涉及人名/产品名等中文文本条件，用 WHERE 字段='值'，注意引号
+4. 日期是 text 类型，比较时直接比字符串（格式 YYYY-MM-DD）
+5. 金额字段（orders.total_amount / customer.total_spent / sales.total_sales / products.price）都是 double
+6. 聚合优先用 SUM/COUNT/AVG，配合 GROUP BY；排序用 ORDER BY，限量用 LIMIT
