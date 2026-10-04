@@ -1,4 +1,4 @@
-"""ECharts 图表结构（前端可直接渲染）。"""
+# ECharts 图表结构（with_structured_output 结构化输出实现）
 from pydantic import BaseModel, Field
 
 

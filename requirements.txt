@@ -1,5 +1,6 @@
-# 多智能体问答平台 依赖
-langgraph>=1.0.4
+# 数据分析平台 依赖
+langgraph>=1.0.7,<1.1.0      # langchain 1.0.0 钉了 <1.1.0 上限
+langgraph-checkpoint>=4.2.0  # checkpoint-redis 0.5.2 的序列化器需要 4.x 的 _DeltaSnapshot
 langchain-core
 langchain-community
 langchain-text-splitters
@@ -10,6 +11,16 @@ pymysql
 python-dotenv
 loguru
 pydantic
+PyJWT
 # FastAPI 服务化（SSE + 登录鉴权）
 fastapi
 uvicorn
+# MySQL 连接池
+dbutils
+# Redis 持久化 Checkpointer（对话记忆重启不丢，没装/连不上自动退内存，不影响运行）
+langgraph-checkpoint-redis
+# RAG 混合检索：BM25 关键词召回 + jieba 中文分词（纯内存；没装也能跑，自动降级纯向量检索）
+rank-bm25
+jieba
+# 邮件正文 Markdown → HTML（LLM 产出的是 Markdown，邮件客户端不渲染会裸露 *#| 符号）
+markdown
