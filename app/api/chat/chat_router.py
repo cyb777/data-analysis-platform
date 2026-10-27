@@ -2,7 +2,7 @@
 # SSE 帧类型（结构化数据直接推给前端渲染）：
 #   type:text        → 文字回答
 #   type:chart       → ECharts 图表 JSON
-#   type:clarify     → 澄清反问标记（前端加输入提示，引导用户补充）
+#   type:clarify     → 澄清反问标记（反问文本含编号候选，前端引导用户回序号）
 #   type:system      → 发邮件调度结果（"邮件已发至 X 收件人" + 收件人列表）
 #   type:status      → 节点进度提示（"正在生成图表…"），只为消除空白等待，
 #                      不进对话历史，被后续 text 帧覆盖即可
@@ -17,25 +17,38 @@ from langgraph.types import Command
 from loguru import logger
 from pydantic import BaseModel
 
-from app.api.auth import get_optional_user   # JWT 校验（体验模式兼容）
+from app.api.auth import get_required_user    # JWT 强制登录（无 token 401，无体验模式）
 
 chat_router = APIRouter()
 
-# thread_id 允许的字符：字母数字、邮箱符号、下划线、横线（去掉空格和特殊符号防注入/超长）
-_THREAD_SAFE_RE = re.compile(r"[^A-Za-z0-9_.@\-]")
+# thread_id 允许的字符：字母数字、下划线、横线（去掉空格和特殊符号防注入/超长）
+_THREAD_SAFE_RE = re.compile(r"[^A-Za-z0-9_\-]")
 
 
 def _namespaced_thread(user_id: int, raw_thread_id: str) -> str:
     """把客户端自报的 thread_id 服务端命名空间化。
 
     - 同一客户端值在不同用户下解析到不同物理线程，杜绝改 id 读他人历史/操作他人 HITL；
-    - 匿名用户（user_id=0）单独一个 guest 命名空间，不与登录用户串；
+    - 登录制：user_id 必为真实员工编号（匿名 guest 命名空间已随体验模式删除）；
     - 过滤非法字符。
     """
     safe = _THREAD_SAFE_RE.sub("", (raw_thread_id or "").strip())[:128] or "default"
-    if user_id:
-        return f"u{user_id}:{safe}"
-    return f"guest:{safe}"
+    return f"u{user_id}:{safe}"
+
+
+def _frame(type_: str, content="", done: bool = False, **extra) -> str:
+    """拼一条 SSE 帧（data: 前缀 + 空行结尾）；extra 附 node/error 等附加字段"""
+    payload = {"type": type_, "content": content, "done": done, **extra}
+    return f"data:{json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _graph_config(request: Request, raw_thread_id: str):
+    """三个端点共用的入口装配：强制登录校验（无 token → 401，登录制无体验模式）→
+    thread_id 服务端命名空间化 → 返回 (user, graph, config)。
+    thread_id 不写进 state：config["configurable"]["thread_id"] 本来就有，节点经签名注入拿。"""
+    user = get_required_user(request)
+    config = {"configurable": {"thread_id": _namespaced_thread(user["user_id"], raw_thread_id)}}
+    return user, request.app.state.graph, config
 
 
 # POST 请求体（fetch 手写 SSE：不再用 query param 传 question）
@@ -109,8 +122,7 @@ async def _sse_events(graph, stream, config):
                 continue
             if msg.content:
                 streamed_chars += len(msg.content)
-                frame = {"type": "text", "content": msg.content, "done": False}
-                yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
+                yield _frame("text", msg.content)
             continue
 
         # mode == "updates"：payload 形如 {节点名: 该节点返回的 state 增量}
@@ -129,16 +141,14 @@ async def _sse_events(graph, stream, config):
             tip = _NEXT_STEP_TIP.get(node_name) or _NODE_STATUS_TIP.get(node_name)
             if tip:
                 # 带上 node 名，前端据此渲染「进度步骤条」而不只是一句灰色文字
-                frame = {"type": "status", "content": tip, "node": node_name, "done": False}
-                yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
+                yield _frame("status", tip, node=node_name)
             if not isinstance(delta, dict):
                 continue
             # 图表 JSON 一算出来就推，不等后面的分析文字
             chart = delta.get("chart_json")
             if chart and not chart_sent:
                 chart_sent = True
-                frame = {"type": "chart", "content": chart, "done": False}
-                yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
+                yield _frame("chart", chart)
 
     # ② 图跑完取最终 state，先看有没有挂起的 HITL 断点
     # 用异步 aget_state：checkpointer 是 AsyncRedisSaver 时同步 get_state 会直接报错
@@ -148,43 +158,37 @@ async def _sse_events(graph, stream, config):
     # 不拦截的话会把旧回答当成这轮的结果推给前端。
     interrupts = [i for t in (final_state.tasks or []) for i in (t.interrupts or [])]
     if interrupts:
-        frame = {"type": "confirm", "content": interrupts[0].value, "done": False}
-        yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
-        yield f"data:{json.dumps({'type': 'text', 'content': '', 'done': True}, ensure_ascii=False)}\n\n"
+        yield _frame("confirm", interrupts[0].value)
+        yield _frame("text", "", done=True)
         return
 
     values = final_state.values or {}
     answer = values.get("answer")
-    need_clarify = values.get("need_clarify", False)
 
     # 文字回答只在【零流式】时才整段推（开了 subgraphs 后 writer 逐字流出，
     # 再推一次整段前端会显示两遍）。兜底场景：clarify 直连 END 没有 token 可流、
     # 以及 writer 流式万一失败时还有内容兜住。
     if answer and streamed_chars == 0:
-        frame = {"type": "text", "content": answer, "done": False}
-        yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
+        yield _frame("text", answer)
 
-    # 澄清标记帧（前端看到后可以引导输入，比如"请补充：时间/酒店/渠道"）
-    # content 为空：帧本身只是「这是反问」的标记，反问内容在上面的 text 帧里。
-    if need_clarify:
-        frame = {"type": "clarify", "content": {}, "done": False}
-        yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
+    # 澄清反问标记帧：反问正文（含编号候选）已由上面的 text 帧渲染进气泡，
+    # 此帧只是「这是反问」的标记，前端补一句输入引导（可回序号选择）。
+    if values.get("route") == "clarify":
+        yield _frame("clarify", {})
 
     # 图表 JSON（chart 分支才非空）；上面 updates 里已推过就跳过
     chart = values.get("chart_json")
     if chart and not chart_sent:
-        frame = {"type": "chart", "content": chart, "done": False}
-        yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
+        yield _frame("chart", chart)
 
     # 发邮件调度结果帧（system 分支才非空）
     #   前端识别后弹"邮件已发送"提示 + 显示收件人列表
     system_r = values.get("system_result") or {}
     if system_r.get("sent_count") is not None or system_r.get("summary"):
-        frame = {"type": "system", "content": system_r, "done": False}
-        yield f"data:{json.dumps(frame, ensure_ascii=False)}\n\n"
+        yield _frame("system", system_r)
 
     # ③ 结束标识
-    yield f"data:{json.dumps({'type': 'text', 'content': '', 'done': True}, ensure_ascii=False)}\n\n"
+    yield _frame("text", "", done=True)
 
 
 def _sse_response(graph, stream, config) -> StreamingResponse:
@@ -197,7 +201,7 @@ def _sse_response(graph, stream, config) -> StreamingResponse:
             import traceback
             logger.error(f"流式返回错误：{e}\n{traceback.format_exc()}")
             # 只回通用文案，异常原文只进服务端日志（防泄露内部地址/堆栈）
-            yield f"data:{json.dumps({'type': 'text', 'content': '服务暂时出错，请稍后重试', 'done': True, 'error': True}, ensure_ascii=False)}\n\n"
+            yield _frame("text", "服务暂时出错，请稍后重试", done=True, error=True)
 
     return StreamingResponse(content=generator(), media_type="text/event-stream")
 
@@ -208,16 +212,13 @@ async def chat(request: Request, body: ChatRequest):
     返回 SSE 流：文字(type:text) → 图表(type:chart) → 结束
     - 上下文压缩由 build.py 的 summarize 节点统一处理，本接口不重复做
     - JWT 接入：fetch 可自定义请求头，token 走标准 Authorization: Bearer。
-      无 token → 体验模式（user_id=0，功能可用但身份不可信）；
-      有 token → 必须合法（否则 401），身份以 token 为准，不接受 body 自报身份。
+      登录制：无 token / token 非法一律 401（无体验模式）；身份以 token 为准，不接受 body 自报身份。
     """
-    question, raw_thread_id = body.question, body.thread_id
-    user = get_optional_user(request)
-    user_id = user["user_id"] if user else 0
-    graph = request.app.state.graph
+    question = body.question
     # thread_id 服务端命名空间化：客户端传同样的值，不同用户也落到不同物理线程
-    thread_id = _namespaced_thread(user_id, raw_thread_id)
-    config = {"configurable": {"thread_id": thread_id}}
+    user, graph, config = _graph_config(request, body.thread_id)
+    user_id = user["user_id"]
+    thread_id = config["configurable"]["thread_id"]
 
     # HITL 卫生处理：这个线程若还挂着上次没确认的邮件断点，
     #   先按「取消」恢复并排空——带新输入 invoke 撞上 pending task 会报错。
@@ -229,7 +230,10 @@ async def chat(request: Request, body: ChatRequest):
                                      stream_mode=["updates"]):
             pass
 
-    stream = graph.astream({"question": question, "user_id": user_id},
+    # thread_id 不写进 state：config["configurable"]["thread_id"] 本来就有，节点经签名注入拿（不重复存储）
+    # user_level 每轮从 token 刷新写入：级别以登录快照为准（旧 token 没 level 字段按 1 兜底，重新登录即刷新）
+    user_level = user.get("level") or 1
+    stream = graph.astream({"question": question, "user_id": user_id, "user_level": user_level},
                            config=config,
                            stream_mode=["updates", "messages"],
                            subgraphs=True)
@@ -248,14 +252,12 @@ async def chat_resume(request: Request, body: ResumeRequest):
     user_id 以断点时刻 checkpointer 里存的为准（发起时的真实身份），
     本接口只校验 token 合法，不接受客户端再报一次身份（防伪造）。
     """
-    raw_thread_id, action = body.thread_id, body.action
-    user = get_optional_user(request)   # 有 token 必须合法；无 token 体验模式也允许（同 /chat）
-    user_id = user["user_id"] if user else 0
-    graph = request.app.state.graph
+    action = body.action
+    # 登录制：无 token 一律 401（体验模式已删）。
     # 命名空间化后，别人即使把 thread_id 改成你的值，解析到的也是他自己的物理线程，
     # 下面的 interrupt 校验会发现没有断点可恢复——无法替你确认群发邮件。
-    thread_id = _namespaced_thread(user_id, raw_thread_id)
-    config = {"configurable": {"thread_id": thread_id}}
+    user, graph, config = _graph_config(request, body.thread_id)
+    thread_id = config["configurable"]["thread_id"]
 
     # 归属/存在校验：只能恢复当前用户线程上真正挂着的断点
     pending = await graph.aget_state(config)
@@ -268,3 +270,22 @@ async def chat_resume(request: Request, body: ResumeRequest):
                            stream_mode=["updates", "messages"],
                            subgraphs=True)
     return _sse_response(graph, stream, config)
+
+
+@chat_router.get("/chat/history")
+async def chat_history(request: Request, thread_id: str = "default"):
+    """拉取当前线程还留存的对话历史（重开页面时前端回填气泡用）。
+    返回 checkpoint 里的 (问, 答) 列表——只含未截断部分：已哨兵删除的更早轮次
+    原文在 mem_43 冷层（key 是哈希、无法按轮次枚举回来），不展示，
+    用 deleted 告诉前端有几轮已归档。
+    """
+    # 同 /chat：thread_id 服务端命名空间化，改 id 也只能读到自己的线程
+    _, graph, config = _graph_config(request, thread_id)
+    snapshot = await graph.aget_state(config)   # 同 aget_state 说明
+    values = snapshot.values or {}
+    history = values.get("history") or []
+    turns = []
+    for item in history:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            turns.append({"q": str(item[0]), "a": str(item[1])})
+    return {"turns": turns, "deleted": values.get("history_deleted", 0)}

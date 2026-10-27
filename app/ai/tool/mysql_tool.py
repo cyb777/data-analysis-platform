@@ -16,7 +16,6 @@ load_dotenv()
 # 连接池全局变量（双检锁单例）
 _pool = None
 _pool_lock = threading.Lock()
-_HAS_DBTUTILS = True
 
 
 
@@ -29,6 +28,8 @@ def _conn_kwargs():
         "password": os.getenv("MYSQL_PASSWORD"),
         "database": os.getenv("MYSQL_DATABASE"),
         "charset": "utf8mb4",
+        # 池化连接反复复用：不开 autocommit，REPEATABLE READ 下旧连接持事务快照，会读到过期数据
+        "autocommit": True,
     }
 
 
@@ -38,8 +39,6 @@ def _get_pool():
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                if not _HAS_DBTUTILS:
-                    return None
                 try:
                     _pool = PooledDB(
                         creator=pymysql,
@@ -60,14 +59,15 @@ def _get_pool():
 def get_conn():
     """拿一个连接：有连接池走池（close 是还回池），没池退化为单次直连（close 是真断开）
 
-    公开函数（无下划线前缀）：写操作方（send_email_tool 留痕 INSERT）
+    公开函数（无下划线前缀）：写操作方（email_service 发信留痕 INSERT）
     也复用这个连接池。
     """
     pool = _get_pool()
     return pool.connection() if pool else pymysql.connect(**_conn_kwargs())
 
 
-# ====== 游标样板收敛：统一连接获取、释放、commit，各处不再手写样板 ======
+# 游标样板收敛：统一连接获取、释放、commit，各处不再手写样板
+# ==========================================================
 
 def _execute(cur, sql: str, params):
     """统一执行入口：params 为空时【不传】第二个参数给 pymysql。
@@ -82,28 +82,28 @@ def _execute(cur, sql: str, params):
         cur.execute(sql)
 
 
-def query_all(sql: str, params=None, dict_cursor: bool = False) -> list:
-    """查多行：返回 list（dict_cursor=True 时每行是 dict，给前端接口用）"""
+def _query(sql: str, params, dict_cursor: bool, one: bool):
+    """查询收口：统一连接获取/释放与游标样式；one=True 取单行（没查到返回 None）"""
     con = get_conn()
     try:
-        cur_cls = pymysql.cursors.DictCursor if dict_cursor else None
-        with (con.cursor(cur_cls) if cur_cls else con.cursor()) as cur:
+        cur_cls = pymysql.cursors.DictCursor if dict_cursor else pymysql.cursors.Cursor
+        with con.cursor(cur_cls) as cur:
             _execute(cur, sql, params)
+            if one:
+                return cur.fetchone()
             return list(cur.fetchall())
     finally:
         con.close()
 
 
+def query_all(sql: str, params=None, dict_cursor: bool = False) -> list:
+    """查多行：返回 list（dict_cursor=True 时每行是 dict，给前端接口用）"""
+    return _query(sql, params, dict_cursor, one=False)
+
+
 def query_one(sql: str, params=None, dict_cursor: bool = False):
     """查一行：返回一行（tuple 或 dict），没查到返回 None"""
-    con = get_conn()
-    try:
-        cur_cls = pymysql.cursors.DictCursor if dict_cursor else None
-        with (con.cursor(cur_cls) if cur_cls else con.cursor()) as cur:
-            _execute(cur, sql, params)
-            return cur.fetchone()
-    finally:
-        con.close()
+    return _query(sql, params, dict_cursor, one=True)
 
 
 def execute_write(sql: str, params=None) -> int:
@@ -126,6 +126,43 @@ def _run_sql(sql: str) -> str:
     except Exception as e:
         logger.error("mysql 执行失败（sql前60字：{}）：{}", sql[:60], e)
         return f"查询失败：{e}"
+
+
+# SELECT 强制加 LIMIT 兜底：没写 LIMIT 的自动补（prompt 软约束不保证生效，这里做硬约束）
+# ======================================================================================
+MAX_ROWS = 100
+
+# 认证表硬黑名单：user_info 存登录凭证哈希，docstring 不教（语料侧）+ 这里硬拦（工具侧），
+# 即使 LLM 猜到表名也读不到——SELECT/DESCRIBE 一律拒绝
+_FORBIDDEN_TABLE_RE = re.compile(r"\buser_info\b", re.IGNORECASE)
+
+
+def _ensure_limit(sql: str) -> str:
+    """给没写 LIMIT 的 SELECT 自动补上 LIMIT 100（硬兜底，防止单次返回上万字）。
+
+    只在确实安全的情况下补，下面几类【原样放行】：
+      - 已经写了 LIMIT（不管在主查询还是子查询里，都不重复加）
+      - 纯聚合查询（只有 COUNT/SUM/AVG/MAX/MIN，没有 GROUP BY）——结果本来就 1 行，
+        补 LIMIT 没意义；而且这类 SQL 常被用来取单个数值（如总量/均值）
+      - 非 SELECT 开头（SHOW/DESCRIBE/EXPLAIN 结果集本来就小）
+    """
+    s = sql.strip().rstrip(";").strip()
+    upper = s.upper()
+
+    if not upper.startswith("SELECT"):
+        return sql
+    # 已有 LIMIT 就不动。用正则而不是 `in`，避免匹配到列名里的 "limit"（如 usage_limit、min_stock）
+    if re.search(r"\bLIMIT\s+\d+", upper):
+        return sql
+    # 纯聚合（无 GROUP BY）结果只有一行，不需要 LIMIT
+    if not re.search(r"\bGROUP\s+BY\b", upper) and re.search(
+            r"\bSELECT\s+(COUNT|SUM|AVG|MAX|MIN)\s*\(", upper):
+        return sql
+
+    # 常规兜底动作（email/chart 一次任务会连续跑多条 SELECT），不是异常，
+    # 用 debug 级别避免刷屏；需要排查时把日志级别调到 DEBUG 即可看到。
+    logger.debug("→ SQL 未写 LIMIT，自动补 LIMIT {} 防止返回过多数据", MAX_ROWS)
+    return f"{s} LIMIT {MAX_ROWS}"
 
 
 @tool("sql_query", args_schema=MYsqlSchema)
@@ -162,16 +199,16 @@ def sql_query_tool(sql: str) -> str:
     - service_order 增值服务订单表: service_order_id, hotel_id, guest_id, reservation_id,
       service_name(SPA/接送机/洗衣/迷你吧/会议室/加床), service_time, quantity, amount,
       order_status(待服务/已完成/已取消)
-    - employee 员工表（业务员工档案）: employee_id, employee_name, hotel_id(总部为NULL),
-      position, department(管理/前厅/客房/餐饮/工程/安保), phone, hire_date, employee_status(在职/离职)
+    - employee 员工表（业务员工档案+收件人+级别）: employee_id(员工编号), employee_name, hotel_id(总部为NULL),
+      position, department(管理/前厅/客房/餐饮/工程/安保), phone, hire_date, employee_status(在职/离职),
+      email(收邮件用，可空), level(级别：1实习/见习 2正式 3经理 4老板 5管理员)
     - service_record 服务记录表（员工对客服务执行记录）: record_id, hotel_id, employee_id, guest_id,
       service_type(客房清洁/开夜床/行李/叫醒/报修处理/迎宾), service_time, result(完成/未完成), remark
     - review_complaint 评价投诉表: review_id, hotel_id, guest_id, reservation_id, channel_id,
       review_type(好评/中评/差评/投诉), rating(1-5), category(卫生/设施/服务/噪音/早餐/位置/性价比),
       content, review_time, handle_status(待处理/处理中/已闭环)
-    - user_info 系统登录账号表（只有在此表的人才能登录）: id, user_name, email,
-      role(管理岗职位：分公司老板/区域经理/店长/前厅经理/客房经理/餐饮经理)
     - notification_record 邮件通知留痕表：每次发信自动写入，可 SELECT 查询
+    （注意：登录认证信息不在可查表范围内，查账号/密码相关一律回答"不在可查范围"）
 
     常见错误提醒：没有 users / customer / orders / room / city 这些表；客户叫 guest（不是 customer/users），
     订单叫 reservation（不是 orders），房型叫 room_type（不是 room）；城市字段在 hotel.city（没有独立城市表）。
@@ -180,65 +217,37 @@ def sql_query_tool(sql: str) -> str:
     stay_record 是实际入住口径；payment 用 biz_type+biz_id 关联房费/餐饮/增值服务单据。
     """
     sql_stripped = sql.strip().upper()
-    # 放行只读元数据查询（SHOW TABLES / DESCRIBE / EXPLAIN），拦真正的写操作
-    if not (sql_stripped.startswith("SELECT")
-            or sql_stripped.startswith("SHOW")
-            or sql_stripped.startswith("DESCRIBE")
-            or sql_stripped.startswith("DESC ")
-            or sql_stripped.startswith("EXPLAIN")):
+    # 认证表黑名单优先于一切（写护栏只拦写，SELECT user_info 也得拦）
+    if _FORBIDDEN_TABLE_RE.search(sql):
+        logger.warning("→ 认证表黑名单拦截：{}", sql[:50])
+        return "（拒绝：该表不在可查范围）"
+    # 放行只读查询（SELECT / WITH CTE / SHOW / DESCRIBE / EXPLAIN），拦真正的写操作
+    if not sql_stripped.startswith(("SELECT", "WITH", "SHOW", "DESCRIBE", "DESC ", "EXPLAIN")):
         logger.warning("→ 只读护栏拦截了非只读语句：{}", sql[:50])
         return "（拒绝：只允许 SELECT/SHOW/DESCRIBE/EXPLAIN 等只读查询）"
     return _run_sql(_ensure_limit(sql))
 
 
-# ====== SELECT 强制加 LIMIT 兜底：没写 LIMIT 的自动补（prompt 软约束不保证生效，这里做硬约束）======
-MAX_ROWS = 100
-
-
-def _ensure_limit(sql: str) -> str:
-    """给没写 LIMIT 的 SELECT 自动补上 LIMIT 100（硬兜底，防止单次返回上万字）。
-
-    只在确实安全的情况下补，下面几类【原样放行】：
-      - 已经写了 LIMIT（不管在主查询还是子查询里，都不重复加）
-      - 纯聚合查询（只有 COUNT/SUM/AVG/MAX/MIN，没有 GROUP BY）——结果本来就 1 行，
-        补 LIMIT 没意义；而且这类 SQL 常被用来取单个数值（如总量/均值）
-      - 非 SELECT 开头（SHOW/DESCRIBE/EXPLAIN 结果集本来就小）
-    """
-    s = sql.strip().rstrip(";").strip()
-    upper = s.upper()
-
-    if not upper.startswith("SELECT"):
-        return sql
-    # 已有 LIMIT 就不动。用正则而不是 `in`，避免匹配到列名里的 "limit"（如 usage_limit、min_stock）
-    if re.search(r"\bLIMIT\s+\d+", upper):
-        return sql
-    # 纯聚合（无 GROUP BY）结果只有一行，不需要 LIMIT
-    if not re.search(r"\bGROUP\s+BY\b", upper) and re.search(
-            r"\bSELECT\s+(COUNT|SUM|AVG|MAX|MIN)\s*\(", upper):
-        return sql
-
-    # 常规兜底动作（email/chart 一次任务会连续跑多条 SELECT），不是异常，
-    # 用 debug 级别避免刷屏；需要排查时把日志级别调到 DEBUG 即可看到。
-    logger.debug("→ SQL 未写 LIMIT，自动补 LIMIT {} 防止返回过多数据", MAX_ROWS)
-    return f"{s} LIMIT {MAX_ROWS}"
-
-
-# ====== 列名自查工具（让 LLM 在不知道表结构时主动查）======
+# 列名自查工具（让 LLM 在不知道表结构时主动查）
+# =============================================
 @tool("describe_table", parse_docstring=True)
 def describe_table_tool(table_name: str) -> str:
     """查看指定表的实际列名和数据类型。
     用法：列名不确定时调用，例 describe_table("guest") → 返回 guest_id, guest_name, total_spent...
 
-    可用表名只有这 17 个：hotel, room_type, guest, reservation, stay_record, channel,
+    可用表名只有这 16 个：hotel, room_type, guest, reservation, stay_record, channel,
     payment, expense, restaurant, meal_order, menu_item, service_order, employee,
-    service_record, review_complaint, user_info, notification_record
+    service_record, review_complaint, notification_record
 
     Args:
-        table_name: 表名（必须是上面 17 个之一）
+        table_name: 表名（必须是上面 16 个之一）
     """
     # 只允许字母数字下划线，防 SQL 注入
     if not table_name.replace("_", "").isalnum():
         return "（拒绝：表名只能包含字母数字下划线）"
+    # 认证表黑名单（与 sql_query 同款硬拦）
+    if _FORBIDDEN_TABLE_RE.search(table_name):
+        return "（拒绝：该表不在可查范围）"
     try:
         rows = query_all(f"DESCRIBE `{table_name}`")
         # 返回格式：列名(类型) 列表，方便 LLM 直接看懂

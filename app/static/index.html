@@ -4,9 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="theme-color" content="#2563eb">
-<meta name="version" content="v2.0-20261001f">
+<meta name="version" content="v2.0-20261019b">
 <title>连锁酒店管理助手</title>
-<link rel="stylesheet" href="/static/css/style.css?v=v2.0-20261001e">
+<link rel="stylesheet" href="/static/css/style.css?v=v2.0-20261019b">
 </head>
 <body>
 
@@ -76,33 +76,26 @@
   </div>
 </div>
 
-<!-- ===== 登录弹窗 ===== -->
+<!-- ===== 登录弹窗（员工编号+密码，2026-10-23 改造：无注册/无验证码）===== -->
 <div class="mask" id="mask" onclick="if(event.target===this)closeModal()">
   <div class="modal">
-    <h3 id="modalTitle">欢迎使用</h3>
-    <div class="tabs">
-      <div class="tab active" id="tabLogin" onclick="switchTab('login')">登录</div>
-      <div class="tab" id="tabReg" onclick="switchTab('register')">注册</div>
+    <h3 id="modalTitle">员工登录</h3>
+    <div class="form-row">
+      <label>员工编号</label>
+      <input id="empIdInput" type="text" placeholder="如 2020000101" autocomplete="username">
     </div>
     <div class="form-row">
-      <label>邮箱</label>
-      <input id="emailInput" type="email" placeholder="you@example.com" autocomplete="email">
-    </div>
-    <div class="form-row">
-      <label>验证码</label>
-      <div class="code-row">
-        <input id="codeInput" placeholder="6 位验证码" maxlength="6" inputmode="numeric" autocomplete="one-time-code">
-        <button class="btn btn-ghost" id="codeBtn" onclick="getCode()">获取验证码</button>
-      </div>
+      <label>密码</label>
+      <input id="pwdInput" type="password" placeholder="初始密码 123456" autocomplete="current-password">
     </div>
     <button class="btn btn-primary submit" id="submitBtn" onclick="submitAuth()">登录</button>
-    <div class="tips">验证码会发送到你的邮箱，请先点击“获取验证码”</div>
+    <div class="tips">账号为员工编号，初始密码 123456；登录后可修改密码、绑定收邮件邮箱</div>
   </div>
 </div>
 
 <!-- ===== Toast 容器 ===== -->
 <div class="toast-container" id="toastContainer"></div>
 
-<script src="/static/js/app.js?v=v2.0-20261001f"></script>
+<script src="/static/js/app.js?v=v2.0-20261020a"></script>
 </body>
 </html>

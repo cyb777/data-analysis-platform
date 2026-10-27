@@ -1,11 +1,14 @@
 # 数据分析平台 依赖
 langgraph>=1.0.7,<1.1.0      # langchain 1.0.0 钉了 <1.1.0 上限
 langgraph-checkpoint>=4.2.0  # checkpoint-redis 0.5.2 的序列化器需要 4.x 的 _DeltaSnapshot
+langchain                    # create_agent / @tool 本体（langchain-core 只是内核，不带 agents）
 langchain-core
 langchain-community
 langchain-text-splitters
 langchain-openai
 langchain-redis
+# 阿里云百炼 SDK：embedding（DashScopeEmbeddings）与 rerank（gte-rerank-v2）都在运行期 import dashscope
+dashscope
 redis
 pymysql
 python-dotenv
@@ -24,3 +27,9 @@ rank-bm25
 jieba
 # 邮件正文 Markdown → HTML（LLM 产出的是 Markdown，邮件客户端不渲染会裸露 *#| 符号）
 markdown
+
+# ===== 以下为测试/评测专用，生产部署可省 =====
+# 在线回归与 e2e 打真实 HTTP（full_regress / e2e_test）
+requests
+# RAGAS 知识库问答链四指标评测（test/test_ragas.py；datasets/httpx 等随它自动带入）
+ragas==0.3.9

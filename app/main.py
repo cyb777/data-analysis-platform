@@ -9,17 +9,21 @@
   ├─ ai/
   │   ├─ model/model.py       ← 模型封装（单例 + 路由轻量模型）
   │   ├─ agent/               ← 四个智能体：SQLQuestion / Echarts / Anlyze / System（registry 单例）
-  │   ├─ tool/                ← 工具层：mysql_tool（查库）/ rag_tool（检索）/ send_email_tool（发信）等
+  │   ├─ tool/                ← 工具层：mysql_tool（查库）/ data_calc_tool（精算）
+  │   │                            email_material_tool（邮件全套：素材三件套 + SMTP 直发，后者非 @tool）
+  │   ├─ rag/                 ← RAG 包：builder（建库管线/幂等增量）/ retriever（在线检索）
+  │   ├─ mem/                 ← 记忆包：history（mem_43 冷层向量库）/ compress（压缩）/ recall（组装+回查）
   │   ├─ schemas/             ← 结构化输出/入参：Route / ChartData / 各工具入参 schema
-  │   ├─ graph/               ← 图：state / build（缓存+重试+记忆）/ context_compressor（历史压缩）
+  │   ├─ graph/               ← 图：state / build（缓存+重试+记忆装配）
   │   └─ nodes/               ← 10 个节点：summarize/route/rag/db/chart/clarify/system×2/writer/chat
   ├─ api/
-  │   ├─ auth/                       ← auth 领域：jwt.py（签发/校验）+ auth_router.py（验证码登录/注册）
+  │   ├─ auth/                       ← auth 领域：jwt.py（签发/校验）+ password.py（PBKDF2）
+  │   │                                + auth_router.py（员工编号登录/改密码/绑邮箱）
   │   ├─ chat/chat_router.py         ← SSE 流式问答接口（text/chart/clarify/system/status/confirm 帧）
-  │   └─ schema/login_schema.py      ← 登录/注册请求结构
+  │   └─ schema/login_schema.py      ← 登录/账号请求结构
   └─ static/                  ← 前端页面（同源托管，访问 / 即可）
 
-启动：python app/main.py   （Redis 必须开着，RAG 建库 + 验证码缓存 + Checkpointer 都用它）
+启动：python app/main.py   （Redis 必须开着，RAG 建库 + Checkpointer + 记忆冷层都用它）
 """
 import sys
 from pathlib import Path
@@ -46,14 +50,12 @@ logger.info("=" * 60)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 服务启动时：构建 LangGraph 图（含 RAG 建库），挂到 app.state 上，接口里随时取
+    # JWT_SECRET 弱默认值直接拒绝启动（先炸再建图，不白跑 RAG 建库）
+    from app.api.auth.jwt import assert_secret_configured
+    assert_secret_configured()
+    # 服务启动时：构建 LangGraph 图（含 RAG 建库 + checkpoint 索引），挂到 app.state 上
     from app.ai.graph.build import build_graph
-    app.state.graph = build_graph()
-    # checkpointer 是 AsyncRedisSaver 时补跑 asetup() 建索引
-    # （同步上下文已在 build 里跑过；这里是 uvicorn 事件循环内的补跑，幂等）
-    checkpointer = getattr(app.state.graph, "checkpointer", None)
-    if hasattr(checkpointer, "asetup"):
-        await checkpointer.asetup()
+    app.state.graph = await build_graph()
     logger.info("LangGraph 图构建完成（RAG 向量库已加载）")
     yield
     logger.info("服务已销毁")

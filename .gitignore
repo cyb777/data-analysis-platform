@@ -1,19 +1,25 @@
+# 环境与密钥（含数据库密码，不要提交）
+.env
+*.env
+
+# IDE / 编辑器
+.idea/
+.vscode/
+.trae/
+
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 日志与临时文件
 *.log
 
-# 环境变量与密钥（务必保留本地副本，切勿提交）
-.env
-
-# 数据库备份等本地产物
-*.sql
-backup/
-
-# 编辑器 / 系统
-.vscode/
-.idea/
-.DS_Store
-
-# 运行时缓存
-.codebuddy/
+# docs/ 下仅追踪白名单四份项目文档，其他（学习笔记/面试速记/HTML 等）一律不进 git
+# RAG 语料在根目录 rag/（不受本规则影响，正常追踪）
+docs/*
+!docs/baseCoding.md
+!docs/baseInfo.md
+!docs/baseMem.md
+!docs/devPlan.md

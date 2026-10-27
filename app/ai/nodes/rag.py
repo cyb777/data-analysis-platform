@@ -2,20 +2,20 @@
 
 物理位置：app/ai/nodes/（和 graph/ 平级）
 
-RAG 工具调用走 app.ai.tool.rag_tool（统一工具层）
+RAG 检索走 app.ai.rag.retriever（在线检索层；建库管线在 app.ai.rag.builder）
 """
 from loguru import logger
 
-from app.ai.tool.rag_tool import retrieve_schema_rag_tool
+from app.ai.rag import retriever
+from app.ai.graph.state import resolve_q
 
 
 def rag_node(state):
-    """RAG 节点：调 RAG 工具检索相关表结构/口径，写进 context"""
-    q = state["question"]
-    # 检索要用 route 改写后的自包含问题——
+    """RAG 节点：检索相关表结构/口径，写进 context"""
+    # 检索要用 route 改写后的自包含问题（resolve_q 统一收口）——
     # 拿"详细一点"这种原始追问去向量库搜不到相关口径。
-    q = state.get("rewritten_q") or q
-    # 走工具层（RAG 工具内部处理兜底重试）
-    context = retrieve_schema_rag_tool.func(q)
+    q = resolve_q(state)
+    # 只召回 tag=hotel 的业务口径定义段，不被表结构段污染
+    context = retriever.retrieve_schema(q, tag_filter="hotel")
     logger.info("  → rag 节点拿到 {} 段口径资料", context.count("---"))
     return {"context": context}

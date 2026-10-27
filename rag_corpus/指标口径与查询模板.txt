@@ -1,0 +1,344 @@
+# 指标口径与查询模板（hotel 库）
+
+本文件是连锁酒店管理助手的"强制口径 + 标准查询模板库"：标准经营问题的推荐 SQL 模板、指标口径、查询规范。
+表名列名的逐列字典以 sql_query 工具说明为准（16 张可查表全部列出），本文件不再重复。
+
+使用规则：
+- 口径（公式 / 过滤条件）是强制的：写 SQL 必须照搬，不得凭直觉自行发挥（多门店汇总时比率类指标禁止直接 AVG）；
+- 模板 SQL 文本仅做参考：`{开始日期}` / `{结束日期}` 是占位符，按实际问题改写时间范围、维度、门店过滤，不要照抄；
+- 模板没覆盖的问题：按 sql_query 工具说明的表清单自己写 SQL，列名不确定用 describe_table 自查。
+
+酒店业务通识（是什么 / 为什么 / 怎么办）见 `业务知识通识.txt`。
+
+## 一、表范围与边界
+
+数据库：`hotel`，字符集 `utf8mb4`，物理共 17 张表，**LLM 可查 16 张**。
+
+- **可查（16 张）**：hotel / room_type / guest / reservation / stay_record / channel / payment / expense / restaurant / meal_order / menu_item / service_order / employee / service_record / review_complaint / notification_record（发信留痕，可 SELECT）
+- **认证表（1 张，不可查）**：user_info——员工账号、密码、登录相关问题一律回答"不在可查范围"；收件人、级别、职位信息都查 employee 表。
+- **关键口径边界**：
+  - `reservation` 是预订，可能取消或 NoShow；`stay_record` 是实际入住，OCC、ADR、RevPAR 以 `stay_record` 为准。
+  - `payment` 统一记录房费、餐饮、增值服务收款；营收只统计 `pay_status='已支付'`，退款单不计入。
+  - `service_order` 是收费增值服务订单；`service_record` 是员工对客服务执行记录（多为免费服务），不要混用。
+  - `employee` 是业务员工档案（职位/级别/邮箱/在职状态）；员工分析默认 `employee_status='在职'`，离职员工需用户明确要求再纳入。
+
+## 二、标准查询模板库
+
+### T1 经营三指标：OCC / ADR / RevPAR（按门店、按月）
+- 触发问法：入住率 / 平均房价 / RevPAR / 经营三指标 / 上月各店表现如何
+- 用表：stay_record JOIN hotel
+- 强制口径：OCC=已售间夜(SUM stay_record.nights)/可售间夜(room_count×统计天数)；ADR=实际房费/已售间夜；RevPAR=实际房费/可售间夜=OCC×ADR；多门店汇总禁止 AVG 各店比率，必须分子分母各自求和再相除
+- 模板 SQL（按自然月时 {开始日期} 取月初、{结束日期} 取下月月初）：
+
+```sql
+SELECT
+    h.hotel_name,
+    SUM(s.nights) AS sold_nights,
+    h.room_count * DAY(LAST_DAY(DATE_FORMAT(s.actual_check_in, '%Y-%m-01'))) AS available_nights,
+    ROUND(SUM(s.nights) / (h.room_count * DAY(LAST_DAY(DATE_FORMAT(s.actual_check_in, '%Y-%m-01')))) * 100, 1) AS occ,
+    ROUND(SUM(s.room_amount) / SUM(s.nights), 0) AS adr,
+    ROUND(SUM(s.room_amount) / (h.room_count * DAY(LAST_DAY(DATE_FORMAT(s.actual_check_in, '%Y-%m-01')))), 0) AS revpar
+FROM stay_record s
+JOIN hotel h ON s.hotel_id = h.hotel_id
+WHERE s.actual_check_in >= {开始日期}
+  AND s.actual_check_in < {结束日期}
+GROUP BY h.hotel_id, h.hotel_name, h.room_count
+ORDER BY revpar DESC;
+```
+
+- 任意时间段的单店/多店汇总：可售间夜改用 `h.room_count * DATEDIFF({结束日期}, {开始日期})`。
+- 平均住宿天数（ALOS）：`AVG(s.nights)`，随本模板一起 SELECT 即可。
+- 用户要求严格按自然月切分跨月入住时，需把每笔入住拆到每日间夜；库内无日历表，可用递归 CTE 生成日期序列。
+
+### T2 营收：总营收 / 房费 / 餐饮 / 增值服务收入
+- 触发问法：营收 / 收入 / 房费收入 / 餐饮收入 / 上月赚了多少钱
+- 用表：payment（按店加 JOIN hotel）
+- 强制口径：只统计 `pay_status='已支付'`；已退款/部分退款不计入；`reservation.total_amount` 是预计金额，不能当实收
+- 模板 SQL（按店拆分收入结构）：
+
+```sql
+SELECT
+    h.hotel_name,
+    SUM(CASE WHEN p.biz_type='房费' THEN p.amount ELSE 0 END) AS room_revenue,
+    SUM(CASE WHEN p.biz_type='餐饮' THEN p.amount ELSE 0 END) AS meal_revenue,
+    SUM(CASE WHEN p.biz_type='增值服务' THEN p.amount ELSE 0 END) AS service_revenue,
+    SUM(p.amount) AS total_revenue
+FROM payment p
+JOIN hotel h ON p.hotel_id=h.hotel_id
+WHERE p.pay_status='已支付'
+  AND p.pay_time >= {开始日期}
+  AND p.pay_time < {结束日期}
+GROUP BY h.hotel_id, h.hotel_name;
+```
+
+- 全连锁总营收：去掉 JOIN/GROUP BY，直接 `SUM(amount)`。
+
+### T3 预订与取消：预订量 / 取消率 / NoShow 率
+- 触发问法：订了多少单 / 取消率 / 没到店的比例 / 预订趋势
+- 用表：reservation（按店加 JOIN hotel）
+- 强制口径：取消率=`order_status='已取消'` 单数/全部预订单数；NoShow 率=`order_status='未入住'`/全部；预订量≠实际入住（实际入住走 T1 的 stay_record）
+- 模板 SQL：
+
+```sql
+SELECT
+    COUNT(*) AS total_orders,
+    SUM(order_status='已取消') AS cancelled,
+    ROUND(SUM(order_status='已取消') / COUNT(*) * 100, 1) AS cancel_rate_pct,
+    SUM(order_status='未入住') AS noshow,
+    ROUND(SUM(order_status='未入住') / COUNT(*) * 100, 1) AS noshow_rate_pct
+FROM reservation
+WHERE book_date >= {开始日期}
+  AND book_date < {结束日期};
+```
+
+- 按下单时间统计用 `book_date`；按"预计入住月份"看改用 `check_in_date`。
+- 提前预订期：`AVG(DATEDIFF(check_in_date, book_date))`——看客人平均提前多少天下单。
+
+### T4 渠道占比：预订渠道 / 实际成交渠道
+- 触发问法：各渠道占比 / OTA 占比 / 携程美团各占多少
+- 用表：reservation JOIN channel；实际成交口径再经 stay_record 关联
+- 强制口径：预订占比按 reservation 全量（可细分全部/已取消/未入住）；实际成交占比只统计有 stay_record 的实际入住单；OTA 佣金率看 `channel.commission_rate`，实际佣金成本也可查 `expense.expense_type='OTA佣金'`
+- 模板 SQL（预订渠道占比）：
+
+```sql
+SELECT c.channel_name,
+       COUNT(*) AS bookings,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM reservation r
+JOIN channel c ON r.channel_id=c.channel_id
+WHERE r.check_in_date >= {开始日期}
+  AND r.check_in_date < {结束日期}
+GROUP BY c.channel_name
+ORDER BY bookings DESC;
+```
+
+- 实际成交占比：`FROM stay_record s JOIN reservation r ON s.reservation_id=r.reservation_id JOIN channel c ON r.channel_id=c.channel_id`，时间字段换成 `s.actual_check_in`。
+
+### T5 评价与投诉：差评率 / 投诉闭环率 / 未闭环清单
+- 触发问法：差评率 / 投诉处理得怎么样 / 还有多少投诉没处理完 / 各门店差评
+- 用表：review_complaint（按店加 JOIN hotel）
+- 强制口径：差评率=差评数/全部评价数，分母只取 好评/中评/差评（投诉单列）；投诉闭环率=`review_type='投诉' AND handle_status='已闭环'` 数/投诉总数
+- 模板 SQL（差评率）：
+
+```sql
+SELECT
+    SUM(review_type='差评') AS bad_reviews,
+    COUNT(*) AS total_reviews,
+    ROUND(SUM(review_type='差评') / COUNT(*) * 100, 1) AS bad_rate_pct
+FROM review_complaint
+WHERE review_time >= {开始日期}
+  AND review_time < {结束日期}
+  AND review_type IN ('好评','中评','差评');
+```
+
+- 投诉闭环率：
+
+```sql
+SELECT
+    COUNT(*) AS complaints,
+    SUM(handle_status='已闭环') AS closed,
+    ROUND(SUM(handle_status='已闭环') / COUNT(*) * 100, 1) AS close_rate_pct
+FROM review_complaint
+WHERE review_type='投诉'
+  AND review_time >= {开始日期} AND review_time < {结束日期};
+```
+
+- 未闭环清单：`WHERE review_type='投诉' AND handle_status<>'已闭环'`，返回门店、类别、内容、评价时间，`LIMIT 100`。
+
+### T6 餐饮经营：餐饮营收 / 订单量 / 人均消费 / 上座率
+- 触发问法：餐饮收入 / 餐厅订了多少单 / 人均吃多少钱 / 上座率翻台率
+- 用表：payment（营收）+ meal_order JOIN restaurant（订单/人数/上座）
+- 强制口径：餐饮营收查 payment（`biz_type='餐饮' AND pay_status='已支付'`）；免单（`pay_status='免单'`）计订单量不计现金收入；人均消费=餐饮营收/就餐人数之和；上座率近似=`SUM(diner_count)/seat_count`
+- 模板 SQL（订单量/就餐人数/翻台率，按餐厅）：
+
+```sql
+SELECT r.restaurant_name,
+       COUNT(*) AS orders,
+       SUM(mo.diner_count) AS diners,
+       ROUND(SUM(mo.diner_count) / r.seat_count, 2) AS seat_turnover
+FROM meal_order mo
+JOIN restaurant r ON mo.restaurant_id=r.restaurant_id
+WHERE mo.meal_time >= {开始日期} AND mo.meal_time < {结束日期}
+GROUP BY r.restaurant_id, r.restaurant_name, r.seat_count;
+```
+
+- 餐饮营收按店走 T2 模板（`biz_type='餐饮'`）；人均消费 = 营收结果 / diners。
+- 菜品毛利 = `menu_item.price - menu_item.cost`；毛利率 = 毛利 / price。
+
+### T7 会员：等级分布 / 复住 / 沉睡预警
+- 触发问法：会员构成 / 回头客多少 / 多久没来的客户 / 沉睡唤醒名单
+- 用表：guest（复住用 stay_record）
+- 强制口径：会员等级=member_level（普通/银卡/金卡/铂金/钻石）；复住=同一 guest_id 在 stay_record 出现 2 次及以上；沉睡=last_stay_date 距今超 180 天（用户指定天数以用户为准）
+- 模板 SQL：
+
+```sql
+-- 等级分布
+SELECT member_level, COUNT(*) AS cnt FROM guest GROUP BY member_level;
+
+-- 时间段内复住人数
+SELECT COUNT(*) AS repeat_guests FROM (
+    SELECT guest_id FROM stay_record
+    WHERE actual_check_in >= {开始日期} AND actual_check_in < {结束日期}
+    GROUP BY guest_id HAVING COUNT(*) >= 2
+) t;
+
+-- 沉睡客户数（要名单则 SELECT guest_id, guest_name, phone, last_stay_date）
+SELECT COUNT(*) AS sleeping FROM guest
+WHERE last_stay_date < DATE_SUB(CURDATE(), INTERVAL 180 DAY);
+```
+
+- 会员消费：`guest.total_spent`（预汇总），或从 payment 按 guest_id 汇总已支付金额。
+- 新增会员数：`SELECT COUNT(*) FROM guest WHERE register_date >= {开始日期} AND register_date < {结束日期}`。
+
+### T8 成本与毛利：支出构成 / GOP
+- 触发问法：成本多少 / 支出构成 / 毛利 / GOP
+- 用表：expense（毛利再加 payment）
+- 强制口径：简化管理毛利=已支付总收入-同期总支出；严格 GOP 口径扣除营业相关成本、不含固定业主费用——`expense_type` 排除 '租金'、'折旧' 后计算近似 GOP
+- 模板 SQL（支出构成，按店按类型）：
+
+```sql
+SELECT h.hotel_name, e.expense_type, SUM(e.amount) AS cost
+FROM expense e
+JOIN hotel h ON e.hotel_id=h.hotel_id
+WHERE e.expense_date >= {开始日期} AND e.expense_date < {结束日期}
+GROUP BY h.hotel_name, e.expense_type;
+```
+
+- GOP：收入用 T2 结果；支出按本模板（严格口径加 `AND e.expense_type NOT IN ('租金','折旧')`），两数相减。
+
+### T9 人效与服务：服务完成率 / 客房人效
+- 触发问法：服务完成率 / 客房人效 / 员工工作量
+- 用表：service_record + employee（人效再加 stay_record）
+- 强制口径：员工统计默认 `employee_status='在职'`；服务完成率=`result='完成'` 数/全部服务记录数；客房人效=已售间夜/客房部在职员工数
+- 模板 SQL：
+
+```sql
+-- 服务完成率（按店）
+SELECT h.hotel_name,
+       COUNT(*) AS records,
+       ROUND(SUM(sr.result='完成') / COUNT(*) * 100, 1) AS done_rate_pct
+FROM service_record sr
+JOIN hotel h ON sr.hotel_id=h.hotel_id
+WHERE sr.service_time >= {开始日期} AND sr.service_time < {结束日期}
+GROUP BY h.hotel_name;
+
+-- 客房人效（按店）
+SELECT h.hotel_name,
+       SUM(s.nights) AS sold_nights,
+       (SELECT COUNT(*) FROM employee e
+        WHERE e.hotel_id=h.hotel_id AND e.department='客房' AND e.employee_status='在职') AS room_staff,
+       ROUND(SUM(s.nights) / (SELECT COUNT(*) FROM employee e
+        WHERE e.hotel_id=h.hotel_id AND e.department='客房' AND e.employee_status='在职'), 1) AS nights_per_staff
+FROM stay_record s JOIN hotel h ON s.hotel_id=h.hotel_id
+WHERE s.actual_check_in >= {开始日期} AND s.actual_check_in < {结束日期}
+GROUP BY h.hotel_id, h.hotel_name;
+```
+
+### T10 排名 Top N：门店 / 菜品 / 渠道
+- 触发问法：哪家店最好 / 卖得最好的菜 / 排名前 5
+- 用表：按主题（示例为菜品销量：meal_order JOIN menu_item）
+- 强制口径：排名必须 `ORDER BY 指标别名 DESC LIMIT N`；用户没给时间范围时 TOP N 按全时段排名
+- 模板 SQL（菜品销量 Top5）：
+
+```sql
+SELECT mi.dish_name, SUM(mo.amount) AS sales, SUM(mo.diner_count) AS diners
+FROM meal_order mo
+JOIN menu_item mi ON mo.menu_item_id=mi.menu_item_id
+WHERE mo.meal_time >= {开始日期} AND mo.meal_time < {结束日期}
+GROUP BY mi.dish_name
+ORDER BY sales DESC
+LIMIT 5;
+```
+
+### T11 发信留痕：邮件发送记录
+- 触发问法：最近发了哪些邮件 / 那封报表发出去没有 / 发信失败原因
+- 用表：notification_record
+- 强制口径：只查询需要的字段，不无意义导出整封正文
+- 模板 SQL：
+
+```sql
+SELECT send_time, to_email, subject, send_status, trigger_source, error_msg
+FROM notification_record
+WHERE send_time >= {开始日期} AND send_time < {结束日期}
+ORDER BY send_time DESC
+LIMIT 100;
+```
+
+- `send_status`：1=成功 0=失败；`trigger_source='email_dispatcher'` 为调度器自动发。
+
+### T12 月度趋势：按月的指标序列（chart 折线图高频）
+- 触发问法：逐月趋势 / 最近 6 个月走势 / 画个趋势图
+- 用表：stay_record / payment 按主题
+- 强制口径：按月分组用 `DATE_FORMAT(时间列, '%Y-%m')`（它只出现在 SELECT/GROUP BY，不包裹 WHERE 里的列，不违反规范第 3 条）；趋势图时间升序
+- 模板 SQL（间夜+房费逐月）：
+
+```sql
+SELECT DATE_FORMAT(s.actual_check_in, '%Y-%m') AS month,
+       SUM(s.nights) AS sold_nights,
+       SUM(s.room_amount) AS room_revenue
+FROM stay_record s
+WHERE s.actual_check_in >= {开始日期} AND s.actual_check_in < {结束日期}
+GROUP BY month
+ORDER BY month;
+```
+
+### T13 环比 / 同比：两期对比
+- 触发问法：比上月 / 环比 / 比去年同期 / 同比 / 涨了还是跌了
+- 用表：按指标主题（payment / stay_record / reservation 等）
+- 强制口径：两期用条件聚合【一次查出】，禁止拆成两次查询再自己心算；增长率=(本期-上期)/上期×100，上期为 0 时不可比（NULLIF 防除零，输出 NULL 并注明）
+- 模板 SQL（营收环比示例）：
+
+```sql
+SELECT
+    SUM(CASE WHEN p.pay_time >= {本期开始} AND p.pay_time < {本期结束} THEN p.amount ELSE 0 END) AS cur_amount,
+    SUM(CASE WHEN p.pay_time >= {上期开始} AND p.pay_time < {上期结束} THEN p.amount ELSE 0 END) AS prev_amount,
+    ROUND(
+        (SUM(CASE WHEN p.pay_time >= {本期开始} AND p.pay_time < {本期结束} THEN p.amount ELSE 0 END)
+       - SUM(CASE WHEN p.pay_time >= {上期开始} AND p.pay_time < {上期结束} THEN p.amount ELSE 0 END))
+        / NULLIF(SUM(CASE WHEN p.pay_time >= {上期开始} AND p.pay_time < {上期结束} THEN p.amount ELSE 0 END), 0)
+        * 100, 1
+    ) AS growth_pct
+FROM payment p
+WHERE p.pay_status='已支付'
+  AND p.pay_time >= {上期开始} AND p.pay_time < {本期结束};
+```
+
+- 环比：上期=紧挨本期的等长前一段（上月/上周）；同比：上期=去年同期。按店对比加 `JOIN hotel` + `GROUP BY`（CASE 里的区间条件不变）。
+
+### T14 房型经营：房型销量 / 房型营收 / 房型结构
+- 触发问法：哪种房型最好卖 / 套房营收占比 / 大床房卖了多少间夜
+- 用表：stay_record JOIN room_type（按店再 JOIN hotel）
+- 强制口径：房型销量/营收以 stay_record（实际入住）为准；`room_type.standard_price` 是门市挂牌价，成交价看 `stay_record.room_amount` / `reservation.booked_price`
+- 模板 SQL（各房型售出间夜与房费）：
+
+```sql
+SELECT rt.room_type_name,
+       SUM(s.nights) AS sold_nights,
+       SUM(s.room_amount) AS room_revenue,
+       ROUND(SUM(s.room_amount) / SUM(s.nights), 0) AS adr
+FROM stay_record s
+JOIN room_type rt ON s.room_type_id=rt.room_type_id
+WHERE s.actual_check_in >= {开始日期} AND s.actual_check_in < {结束日期}
+GROUP BY rt.room_type_id, rt.room_type_name
+ORDER BY sold_nights DESC;
+```
+
+## 三、查询规范
+
+1. 只能生成 `SELECT / SHOW / DESCRIBE / EXPLAIN` 等只读 SQL，禁止 INSERT、UPDATE、DELETE、DROP、ALTER。
+2. 查询明细必须加 `LIMIT`，默认不超过 100 行；纯聚合且无 GROUP BY 的查询可不加 LIMIT。
+3. 日期字段使用 DATE/DATETIME，不要把日期当字符串前缀匹配；时间过滤【必须】对裸列做区间比较（`>= 开始日期 AND < 结束日期`）：禁止 `DATE(列)`、`DATE_FORMAT(列)` 等函数包裹列名做过滤——函数包裹会让索引失效，百万行表（stay_record 535 万行）从毫秒级掉到几十秒。
+4. 金额字段是 DECIMAL；求和用 `SUM()`，保留两位或按展示需要 ROUND。
+5. OCC、ADR、RevPAR、间夜量使用 stay_record；预订量、取消率、NoShow 使用 reservation；实收营收使用 payment。
+6. 计算营收必须加 `pay_status='已支付'`；不能直接把预订金额当实际收入。
+7. notification_record 可以 SELECT，但只查询需要的字段，不要无意义导出整封正文。
+8. user_info 是认证表，不在可查范围；账号/密码/登录类问题不要生成 SQL。
+9. 员工业务分析默认查 employee 且 `employee_status='在职'`；收件人、职位、级别、邮箱也都在 employee 表。
+10. 没有 customer、users、orders、products、room、city 等表；客户叫 guest，预订叫 reservation，房型叫 room_type，城市字段在 hotel.city。
+11. 城市、门店、房型、渠道、客户、员工等中文名应使用数据库中的实际中文取值，必要时先用 DISTINCT 自查。
+12. 多门店汇总时要先按门店口径计算，再汇总；OCC、ADR、RevPAR 不要只按订单行数计算。
+13. 排序要明确指标别名，Top N 查询使用 `ORDER BY ... DESC LIMIT N`。
+14. 查询中如需 DATE_FORMAT，注意 `%Y`、`%m` 等格式应直接写在 SQL 中；工具已处理空参数场景。
+15. 如果模板库没覆盖、列名又不确定，使用 describe_table 工具自查，不要编造字段。
+16. WHERE 条件里的列保持裸列：对列做任何函数包裹或运算（`DATE(列)`、`列*0.8 > x`）都会废掉索引——把时间/数值换算挪到常量一侧（`列 > x/0.8`）；`LIKE '%xx'` 前缀通配同样全表扫，中文取值精确匹配用 `=` 或 `IN`。
+17. 时间锚点以消息开头的【今天】为准：问题里没给年份的月份/季度（"8月"、"Q2"），指最近已过去的那个（今天 2026-10-25，则"8月"=2026-08）；"最近 N 天/N 月"以今天为终点往前推。不要按库里数据的最大日期脑补年份。

@@ -1,118 +1,77 @@
-# 登录/注册路由：邮箱验证码登录、注册（含验证码发送）。
-# 本路由无 prefix，路径就是 /login、/register 等（文件搬家不影响前端）。
-import secrets
+# 账号接口：登录（员工编号+密码）/ 改密码 / 绑定邮箱
+#
+# 设计要点：
+#   ① 无公开注册——账号随员工数据预置（user_info 纯认证表，初始密码 123456）；
+#   ② 登录校验 user_info.password_hash（PBKDF2），身份档案（姓名/职位/级别/邮箱）
+#      一律以 employee 表为准，登录时 JOIN 一次带出并签入 JWT（level）；
+#   ③ 改密码 / 绑邮箱要求携带 JWT（get_required_user），操作的是"自己"这一行。
+import re
 
-import redis
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 
-from app.api.schema.login_schema import (
-    SendCodeSchema, LoginSchema, RegisterCodeSchema, RegisterSchema,
-)
-from app.ai.tool.mysql_tool import query_one, execute_write
-from app.ai.tool.send_email_tool import send_email_direct
-from app.api.auth import create_token   # 登录/注册成功签发 JWT
+from app.api.auth.jwt import create_token, get_required_user
+from app.api.auth.password import hash_password, verify_password
+from app.api.schema.login_schema import BindEmailSchema, ChangePasswordSchema, LoginSchema
+from app.ai.tool.mysql_tool import execute_write, query_one
 
-# Redis 连接：验证码存这里（带 ex=60 秒过期，自动失效，不用手动清）
-redis_conn = redis.Redis(host="127.0.0.1", port=6379, db=0)
+auth_router = APIRouter(prefix="/auth", tags=["账号"])
 
-auth_router = APIRouter()
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def _gen_code() -> str:
-    """生成 6 位数字验证码（secrets：验证码属安全场景，不用 random）"""
-    return str(secrets.randbelow(900000) + 100000)
+@auth_router.post("/login", summary="员工编号+密码登录")
+def login(body: LoginSchema):
+    # ① 认证表查密码哈希（user_info 不进 LLM 查询清单，但应用层照常访问）
+    row = query_one(
+        "SELECT u.password_hash, e.employee_name, e.position, e.level, e.employee_status "
+        "FROM user_info u JOIN employee e ON e.employee_id = u.employee_id "
+        "WHERE u.employee_id = %s", (body.employee_id,))
+    if row is None:
+        raise HTTPException(status_code=401, detail="编号或密码错误")
+    pwd_hash, emp_name, position, level, status = row
+    # ② 验密（错误提示不区分编号不存在/密码错，防枚举）
+    if not verify_password(body.password, pwd_hash):
+        raise HTTPException(status_code=401, detail="编号或密码错误")
+    if status != "在职":
+        raise HTTPException(status_code=403, detail="该员工已离职，账号已停用")
+
+    token = create_token(employee_id=body.employee_id, level=level, password_hash=pwd_hash)
+    logger.info(f"登录成功：{emp_name}({body.employee_id}) position={position} level={level}")
+    return {
+        "message": "登录成功",
+        "employee_id": body.employee_id,
+        "employee_name": emp_name,
+        "position": position,
+        "level": level,
+        "token": token,
+    }
 
 
-@auth_router.post("/send_code")
-def send_code(args: SendCodeSchema):
-    """登录发码：邮箱已注册才发，验证码存 Redis（key=login:code:{email}，60s）"""
-    row = query_one("SELECT id FROM user_info WHERE email=%s", (args.email,))
-    if not row:
-        return {"code": 500, "msg": "该邮箱未注册，请先注册"}
-    # 发码限流：同邮箱 60s 只发一封（setnx 占位，占不到说明 60s 内刚发过）
-    if not redis_conn.set(f"login:sendlock:{args.email}", 1, ex=60, nx=True):
-        return {"code": 500, "msg": "发送太频繁，请 60 秒后再试"}
-    code = _gen_code()
-    redis_conn.set(f"login:code:{args.email}", code, ex=60)
-    rs = send_email_direct(
-        to=args.email,
-        subject="登录验证码",
-        content=f"您的登录验证码是：{code}，60秒内有效。",
-        notification_type="verification",
-        trigger_source="verify_code",
-    )
-    if "失败" in rs:
-        return {"code": 500, "msg": "验证码邮件发送失败，请稍后重试"}
-    logger.info(f"登录验证码已发送 → {args.email}")
-    return {"code": 200, "msg": "验证码已发送，60 秒内有效"}
+@auth_router.post("/change_password", summary="修改自己的密码（需登录）")
+def change_password(body: ChangePasswordSchema, auth: dict = Depends(get_required_user)):
+    emp_id = auth["user_id"]
+    row = query_one("SELECT password_hash FROM user_info WHERE employee_id=%s", (emp_id,))
+    if row is None or not verify_password(body.old_password, row[0]):
+        raise HTTPException(status_code=400, detail="原密码错误")
+    # 改密后旧 token 天然失效——token 里的 pwd_sig 与库中新哈希失配即 401，
+    # 无需吊销动作
+    execute_write("UPDATE user_info SET password_hash=%s WHERE employee_id=%s",
+                  (hash_password(body.new_password), emp_id))
+    logger.info(f"员工 {emp_id} 修改密码成功，旧 token 随哈希变更自然失效")
+    return {"message": "密码修改成功，其他登录态已失效，请使用新密码重新登录"}
 
 
-@auth_router.post("/login")
-def login(args: LoginSchema):
-    """登录：验 Redis 验证码 → 查 user_info 拿身份 → 签发 JWT（顶层返回 user_id/role/token）"""
-    # get(key)：按邮箱取出刚才存的验证码（取不到=没发过/已过期）
-    # .decode()：Redis 存的是字节(bytes)，要转成字符串再比对
-    code = redis_conn.get(f"login:code:{args.email}")
-    if not code or code.decode() != args.code:
-        return {"code": 500, "msg": "验证码错误或已过期"}
-    # query_one + %s 参数化：pymysql 负责转义，没查到返回 None
-    row = query_one("SELECT id, role FROM user_info WHERE email=%s", (args.email,))
-    if not row:
-        return {"code": 500, "msg": "该邮箱未注册，请先注册"}
-    user_id, role = row[0], row[1] or ""
-    redis_conn.delete(f"login:code:{args.email}")   # 验证通过即焚毁（防 60s 窗口内重复使用）
-    token = create_token(user_id, args.email, role)
-    logger.info(f"登录成功 → {args.email} (user_id={user_id})")
-    return {"code": 200, "msg": "登录成功",
-            "user_id": user_id, "email": args.email, "role": role, "token": token}
-
-
-@auth_router.post("/register_send_code")
-def register_send_code(args: RegisterCodeSchema):
-    """注册发码：邮箱未注册才发，验证码存 Redis（key=reg:code:{email}，60s）"""
-    if "@" not in args.email:
-        return {"code": 400, "msg": "请输入正确的邮箱格式"}
-    row = query_one("SELECT id FROM user_info WHERE email=%s", (args.email,))
-    if row:
-        return {"code": 500, "msg": "该邮箱已注册，请直接登录"}
-    # 发码限流：同邮箱 60s 只发一封（setnx 占位，占不到说明 60s 内刚发过）
-    if not redis_conn.set(f"reg:sendlock:{args.email}", 1, ex=60, nx=True):
-        return {"code": 500, "msg": "发送太频繁，请 60 秒后再试"}
-    code = _gen_code()
-    redis_conn.set(f"reg:code:{args.email}", code, ex=60)
-    rs = send_email_direct(
-        to=args.email,
-        subject="注册验证码",
-        content=f"您的注册验证码是：{code}，60秒内有效。",
-        notification_type="verification",
-        trigger_source="verify_code",
-    )
-    if "失败" in rs:
-        return {"code": 500, "msg": "验证码邮件发送失败，请稍后重试"}
-    logger.info(f"注册验证码已发送 → {args.email}")
-    return {"code": 200, "msg": "验证码已发送，60 秒内有效"}
-
-
-@auth_router.post("/register")
-def register(args: RegisterSchema):
-    """注册：验码 → 查重 → execute_write 写 user_info → 签发 JWT（顶层返回 user_id/role/token）"""
-    code = redis_conn.get(f"reg:code:{args.email}")
-    if code is None:
-        return {"code": 500, "msg": "验证码已过期，请重新获取"}
-    if code.decode() != str(args.code):
-        return {"code": 500, "msg": "验证码错误"}
-    # 再次查重（防并发：发码后到注册之间同邮箱被别人用了）
-    row = query_one("SELECT id FROM user_info WHERE email=%s", (args.email,))
-    if row:
-        return {"code": 500, "msg": "该邮箱已注册，请直接登录"}
-    # execute_write：统一 commit + 返回 lastrowid；user_name 先给默认值，role 用库默认
-    user_id = execute_write(
-        "INSERT INTO user_info (user_name, email) VALUES (%s, %s)",
-        ("user", args.email),
-    )
-    redis_conn.delete(f"reg:code:{args.email}")   # 用完即焚
-    token = create_token(user_id, args.email, "")
-    logger.info(f"注册成功 → {args.email} (user_id={user_id})")
-    return {"code": 200, "msg": "注册成功",
-            "user_id": user_id, "email": args.email, "role": "", "token": token}
+@auth_router.post("/bind_email", summary="绑定/更改自己的收邮件邮箱（需登录）")
+def bind_email(body: BindEmailSchema, auth: dict = Depends(get_required_user)):
+    emp_id = auth["user_id"]
+    email = body.email.strip()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="邮箱格式不正确")
+    # UNIQUE 约束兜底，但提前查一遍给出友好提示
+    owner = query_one("SELECT employee_id FROM employee WHERE email=%s", (email,))
+    if owner is not None and owner[0] != emp_id:
+        raise HTTPException(status_code=400, detail="该邮箱已被其他员工绑定")
+    execute_write("UPDATE employee SET email=%s WHERE employee_id=%s", (email, emp_id))
+    logger.info(f"员工 {emp_id} 绑定邮箱 {email}")
+    return {"message": f"邮箱绑定成功：{email}"}

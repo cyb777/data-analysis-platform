@@ -1,0 +1,121 @@
+===== 0. 服务存活检查 =====
+  [OK] 服务在线（HTTP 200）
+
+===== 1. 开始测试 11 个问题（每题间等 3s 让 Uvicorn 回收连接）=====
+
+--- [1] 预期: db 纯查询 ---
+    问: 8月入住率 TOP5 的酒店是哪些...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 239}
+    文字长度: 331, 摘要: ## 2026年8月入住率 TOP5 酒店
+
+图表展示了2026年8月入住率最高的5家酒店，整体均在88%以上，其中杭州西湖店位居第一。
+
+| 排名 | 酒店 | 入住率（OCC） |
+|---|---|---:|
+| 1 | 云栖精选酒店
+    [CHART] type=bar, x_axis=5, series=5, title=2026年8月入住率（OCC）TOP5 酒店
+
+--- [2] 预期: db 纯查询 ---
+    问: 8月平均房价 ADR 是多少...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 253}
+    文字长度: 352, 摘要: **2026年8月整体平均房价 ADR 约为 ¥561.03/间夜。**
+
+各门店中 ADR 排名前五的门店如下：
+
+| 排名 | 门店 | ADR（元/间夜） |
+|---|---|---:|
+| 1 | 云栖国际酒店（上海南京路店） |
+    [CHART] type=bar, x_axis=5, series=5, title=2026年8月各门店平均房价ADR（TOP5，整体ADR约¥561.03）
+
+--- [3] 预期: chart 柱状图 ---
+    问: 按渠道统计预订量，画个柱状图...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 66}
+    文字长度: 83, 摘要: 最近30天各渠道预订量柱状图显示：**会员直订以 3,113 单排名第一**，携程（1,985 单）、美团（1,745 单）紧随其后，旅行社团队最少，为 117 单。
+    [CHART] type=bar, x_axis=8, series=8, title=最近30天各渠道预订量
+
+--- [4] 预期: chart 饼图 ---
+    问: 各渠道房费收入占比饼图...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 84}
+    文字长度: 110, 摘要: 该饼图展示了最近30天各渠道的房费收入贡献：总房费收入约 **1,885.28万元**，其中**会员直订占比最高，为26.5%**，携程、美团分别占 **22.3%、16.4%**，抖音和旅行社团队占比最低，均不足3%。
+    [CHART] type=pie, x_axis=8, series=8, title=各渠道房费收入占比（最近30天）
+
+--- [5] 预期: chart 折线图 ---
+    问: 最近 6 个月 RevPAR 趋势折线图...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 60}
+    文字长度: 73, 摘要: 该折线图展示了 2026 年 4—9 月 RevPAR 走势：数值在 371.27—463.01 元/间夜间波动，8 月达到峰值，9 月明显回落。
+    [CHART] type=line, x_axis=6, series=6, title=最近6个月RevPAR趋势（元/间夜）
+
+--- [6] 预期: chart 柱状图 ---
+    问: 按城市看入住率排名...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 184}
+    文字长度: 271, 摘要: ## 各城市入住率（OCC）排名
+
+图表展示了 **2026年9月各城市入住率 Top 5**，广州以 76.3% 排名第一。
+
+| 排名 | 城市 | OCC |
+|---:|---|---:|
+| 1 | 广州 | 76.3% |
+| 
+    [CHART] type=bar, x_axis=5, series=5, title=各城市入住率(OCC)排名（2026年9月，Top 5）
+
+--- [7] 预期: chart 对比出图 ---
+    问: 比较8月和7月的入住率和 RevPAR 差异...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 487}
+    文字长度: 745, 摘要: 图表说明：该图对比了 2026 年 8 月与 7 月 10 家门店入住率（OCC）和 RevPAR 的环比相对变化率。
+
+### ① 关键数据
+- 8 月 10 家门店中 **6 家双升、4 家双降**；当前资料仅含环比变化率，无法给出具体
+    [CHART] type=bar, x_axis=20, series=20, title=2026年8月 vs 7月 各门店 OCC 与 RevPAR 环比变化率（%）
+
+--- [8] 预期: chart 对比出图 ---
+    问: 对比各酒店的 OCC 和 ADR...
+    [OK] HTTP 200, types: {'status': 3, 'chart': 1, 'text': 490}
+    文字长度: 746, 摘要: ## 分析步骤
+
+1. 提取已有图表中的近30天各酒店 ADR 数据。
+2. 核查 OCC 数据：当前资料未提供各酒店入住率，因此无法完成 OCC 对比，也不做推断。
+
+## 最终回答
+
+### ① 关键数据
+
+近30天 ADR 排名前五的
+    [CHART] type=bar, x_axis=5, series=5, title=近30天各酒店ADR对比（元/间夜，TOP5）
+
+--- [9] 预期: system 邮件(HITL) ---
+    问: 把上周的酒店经营报告汇总发邮件给分公司老板...
+    [OK] HTTP 200, types: {'status': 2, 'confirm': 1, 'text': 1}
+    文字长度: 0, 摘要: 
+    [CONFIRM] keys: ['recipients', 'subject', 'content']
+
+--- [10] 预期: system 邮件(HITL) ---
+    问: 检查未闭环的投诉并通知店长...
+    [OK] HTTP 200, types: {'status': 4, 'text': 107, 'system': 1}
+    文字长度: 171, 摘要: 邮件通知未能发送。
+
+**失败原因：** 系统未在收件人配置中找到角色为"店长"的收件人，因此无法完成通知邮件的起草与发送。
+
+**建议操作：**
+1. 请检查 `user_info` 表中是否已配置对应门店店长的账号及邮箱信息；
+2. 确
+    [SYSTEM] {'sent_count': 0, 'recipients': [], 'subject': '', 'summary': '未找到 role=店长 的收件人，请检查 user_info 表'}
+
+--- [11] 预期: system 邮件(HITL) ---
+    问: 把本周差评清单发给前厅经理...
+    [FAIL] 异常: ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out.
+
+===== 2. 测试汇总 =====
+  共测试 11 个问题
+  [OK] 8月入住率 TOP5 的酒店是哪些... 预期 db 纯查询，收到 ['status', 'chart', 'text']
+  [OK] 8月平均房价 ADR 是多少... 预期 db 纯查询，收到 ['status', 'chart', 'text']
+  [OK] 按渠道统计预订量，画个柱状图... 预期 chart 柱状图，收到 ['status', 'chart', 'text']
+  [OK] 各渠道房费收入占比饼图... 预期 chart 饼图，收到 ['status', 'chart', 'text']
+  [OK] 最近 6 个月 RevPAR 趋势折线图... 预期 chart 折线图，收到 ['status', 'chart', 'text']
+  [OK] 按城市看入住率排名... 预期 chart 柱状图，收到 ['status', 'chart', 'text']
+  [OK] 比较8月和7月的入住率和 RevPAR 差异... 预期 chart 对比出图，收到 ['status', 'chart', 'text']
+  [OK] 对比各酒店的 OCC 和 ADR... 预期 chart 对比出图，收到 ['status', 'chart', 'text']
+  [OK] 把上周的酒店经营报告汇总发邮件给分公司老板... 预期 system 邮件(HITL)，收到 ['status', 'confirm', 'text']
+  [OK] 检查未闭环的投诉并通知店长... 预期 system 邮件(HITL)，收到 ['status', 'text', 'system']
+  [FAIL] 把本周差评清单发给前厅经理... 预期 system 邮件(HITL)，结果：异常
+
+  成功: 10/11, 失败: 1
